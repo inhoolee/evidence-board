@@ -1,10 +1,11 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { 
   FolderHeart, 
   Search, 
   Settings, 
   FileText, 
   Camera, 
+  Lightbulb,
   Link as LinkIcon, 
   Bookmark, 
   Plus, 
@@ -15,6 +16,57 @@ import {
 } from 'lucide-react';
 import { motion } from 'motion/react';
 import { Connection, EvidenceItem, EvidenceType, Position } from './types';
+
+type BackgroundTheme = 'white' | 'glass' | 'woody';
+type ItemSize = { width: number; height: number };
+type ItemGeometry = {
+  center: Position;
+  halfWidth: number;
+  halfHeight: number;
+  rotationRad: number;
+};
+type CameraState = {
+  zoom: number;
+  pan: Position;
+};
+type CanvasSize = {
+  width: number;
+  height: number;
+};
+type BoardBounds = {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+  width: number;
+  height: number;
+};
+type ViewportRect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+const BOARD_THEME_STORAGE_KEY = 'evidence-board-background-theme';
+const BOARD_LAMP_STORAGE_KEY = 'evidence-board-lamp-enabled';
+const SAFE_AREA_INSET = 56;
+const BOARD_PADDING = 180;
+const DEFAULT_ZOOM = 0.625;
+const MIN_ZOOM = 0.2;
+const MAX_ZOOM = 2;
+const DEFAULT_BOARD_SIZE: CanvasSize = { width: 1200, height: 800 };
+const ITEM_FALLBACK_SIZES: Record<EvidenceType, ItemSize> = {
+  photo: { width: 256, height: 304 },
+  note: { width: 192, height: 192 },
+  report: { width: 320, height: 224 },
+};
+
+const BACKGROUND_THEMES: Array<{ id: BackgroundTheme; label: string; accent: string }> = [
+  { id: 'white', label: 'White', accent: 'bg-stone-100' },
+  { id: 'glass', label: 'Glass', accent: 'bg-cyan-200/80' },
+  { id: 'woody', label: 'Woody', accent: 'bg-amber-500' },
+];
 
 const INITIAL_ITEMS: EvidenceItem[] = [
   {
@@ -61,13 +113,136 @@ const SAMPLE_PHOTOS = [
   'https://images.unsplash.com/photo-1518391846015-55a9cc003b25?q=80&w=1000&auto=format&fit=crop'
 ];
 
+const isBackgroundTheme = (value: string | null): value is BackgroundTheme =>
+  value === 'white' || value === 'glass' || value === 'woody';
+
+const clamp = (value: number, min: number, max: number) => {
+  if (min > max) {
+    return (min + max) / 2;
+  }
+
+  return Math.min(Math.max(value, min), max);
+};
+
+const getRotatedExtents = (width: number, height: number, radians: number) => {
+  const halfWidth = width / 2;
+  const halfHeight = height / 2;
+  const cos = Math.cos(radians);
+  const sin = Math.sin(radians);
+
+  return {
+    x: Math.abs(cos) * halfWidth + Math.abs(sin) * halfHeight,
+    y: Math.abs(sin) * halfWidth + Math.abs(cos) * halfHeight,
+  };
+};
+
+const getConnectionEndpoint = (geometry: ItemGeometry, targetCenter: Position): Position => {
+  const dx = targetCenter.x - geometry.center.x;
+  const dy = targetCenter.y - geometry.center.y;
+
+  if (Math.abs(dx) < 0.001 && Math.abs(dy) < 0.001) {
+    return geometry.center;
+  }
+
+  const cos = Math.cos(geometry.rotationRad);
+  const sin = Math.sin(geometry.rotationRad);
+  const localDx = dx * cos + dy * sin;
+  const localDy = -dx * sin + dy * cos;
+  const scale = 1 / Math.max(Math.abs(localDx) / geometry.halfWidth, Math.abs(localDy) / geometry.halfHeight);
+  const localX = localDx * scale;
+  const localY = localDy * scale;
+
+  return {
+    x: geometry.center.x + localX * cos - localY * sin,
+    y: geometry.center.y + localX * sin + localY * cos,
+  };
+};
+
+const arePositionsEqual = (a: Position, b: Position) =>
+  Math.abs(a.x - b.x) < 0.01 && Math.abs(a.y - b.y) < 0.01;
+
+const getViewportRect = (camera: CameraState, canvasSize: CanvasSize): ViewportRect => {
+  const zoom = camera.zoom || 1;
+
+  return {
+    x: -camera.pan.x / zoom,
+    y: -camera.pan.y / zoom,
+    width: canvasSize.width / zoom,
+    height: canvasSize.height / zoom,
+  };
+};
+
+const getBoardBounds = (items: EvidenceItem[], itemSizes: Record<string, ItemSize>): BoardBounds => {
+  if (!items.length) {
+    return {
+      minX: -BOARD_PADDING,
+      minY: -BOARD_PADDING,
+      maxX: DEFAULT_BOARD_SIZE.width + BOARD_PADDING,
+      maxY: DEFAULT_BOARD_SIZE.height + BOARD_PADDING,
+      width: DEFAULT_BOARD_SIZE.width + BOARD_PADDING * 2,
+      height: DEFAULT_BOARD_SIZE.height + BOARD_PADDING * 2,
+    };
+  }
+
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+
+  items.forEach(item => {
+    const size = itemSizes[item.id] ?? ITEM_FALLBACK_SIZES[item.type];
+    const rotationRad = (item.rotation * Math.PI) / 180;
+    const rotatedExtents = getRotatedExtents(size.width, size.height, rotationRad);
+    const centerX = item.position.x + size.width / 2;
+    const centerY = item.position.y + size.height / 2;
+
+    minX = Math.min(minX, centerX - rotatedExtents.x);
+    minY = Math.min(minY, centerY - rotatedExtents.y);
+    maxX = Math.max(maxX, centerX + rotatedExtents.x);
+    maxY = Math.max(maxY, centerY + rotatedExtents.y);
+  });
+
+  return {
+    minX: minX - BOARD_PADDING,
+    minY: minY - BOARD_PADDING,
+    maxX: maxX + BOARD_PADDING,
+    maxY: maxY + BOARD_PADDING,
+    width: maxX - minX + BOARD_PADDING * 2,
+    height: maxY - minY + BOARD_PADDING * 2,
+  };
+};
+
 export default function App() {
   const [items, setItems] = useState<EvidenceItem[]>(INITIAL_ITEMS);
   const [connections, setConnections] = useState<Connection[]>(INITIAL_CONNECTIONS);
-  const [zoom, setZoom] = useState(0.625);
+  const [itemSizes, setItemSizes] = useState<Record<string, ItemSize>>({});
+  const [camera, setCamera] = useState<CameraState>({
+    zoom: DEFAULT_ZOOM,
+    pan: { x: 0, y: 0 },
+  });
+  const [canvasSize, setCanvasSize] = useState<CanvasSize>({ width: 0, height: 0 });
+  const [backgroundTheme, setBackgroundTheme] = useState<BackgroundTheme>(() => {
+    if (typeof window === 'undefined') {
+      return 'woody';
+    }
+
+    const storedTheme = window.localStorage.getItem(BOARD_THEME_STORAGE_KEY);
+    return isBackgroundTheme(storedTheme) ? storedTheme : 'woody';
+  });
+  const [isLampOn, setIsLampOn] = useState(() => {
+    if (typeof window === 'undefined') {
+      return true;
+    }
+
+    const storedLampState = window.localStorage.getItem(BOARD_LAMP_STORAGE_KEY);
+    return storedLampState === null ? true : storedLampState === 'true';
+  });
   const [isLinkMode, setIsLinkMode] = useState(false);
   const [linkSourceId, setLinkSourceId] = useState<string | null>(null);
   const [selectedConnectionId, setSelectedConnectionId] = useState<string | null>(null);
+  const [activeDragId, setActiveDragId] = useState<string | null>(null);
+  const [isDragAtBoundary, setIsDragAtBoundary] = useState(false);
+  const [isPanning, setIsPanning] = useState(false);
   const canvasRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const evidenceRefs = useRef<Record<string, HTMLDivElement | null>>({});
@@ -75,16 +250,90 @@ export default function App() {
   const idCounterRef = useRef(INITIAL_ITEMS.length + 1);
   const connectionCounterRef = useRef(INITIAL_CONNECTIONS.length + 1);
   const activeDragRef = useRef<{ id: string; pointerStart: Position; itemStart: Position } | null>(null);
-  const zoomRef = useRef(zoom);
+  const activePanRef = useRef<{ pointerStart: Position; panStart: Position } | null>(null);
+  const cameraRef = useRef(camera);
+  const canvasSizeRef = useRef(canvasSize);
   const dragHandlersRef = useRef<{ onMove: (event: PointerEvent) => void; onUp: () => void } | null>(null);
+  const panHandlersRef = useRef<{ onMove: (event: PointerEvent) => void; onUp: () => void } | null>(null);
+  const measurementSignature = items
+    .map(item => `${item.id}:${item.type}:${item.title}:${item.fileNumber ?? ''}:${item.content ?? ''}:${item.imageUrl ?? ''}`)
+    .join('|');
 
   useEffect(() => {
     itemsRef.current = items;
   }, [items]);
 
   useEffect(() => {
-    zoomRef.current = zoom;
-  }, [zoom]);
+    cameraRef.current = camera;
+  }, [camera]);
+
+  useEffect(() => {
+    canvasSizeRef.current = canvasSize;
+  }, [canvasSize]);
+
+  const measureItemSizes = useCallback(() => {
+    setItemSizes(prev => {
+      let changed = Object.keys(prev).length !== itemsRef.current.length;
+      const nextSizes: Record<string, ItemSize> = {};
+
+      itemsRef.current.forEach(item => {
+        const node = evidenceRefs.current[item.id];
+        const nextSize = node
+          ? { width: node.offsetWidth, height: node.offsetHeight }
+          : prev[item.id] ?? ITEM_FALLBACK_SIZES[item.type];
+
+        nextSizes[item.id] = nextSize;
+
+        const currentSize = prev[item.id];
+        if (!currentSize || currentSize.width !== nextSize.width || currentSize.height !== nextSize.height) {
+          changed = true;
+        }
+      });
+
+      return changed ? nextSizes : prev;
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    measureItemSizes();
+  }, [measureItemSizes, measurementSignature]);
+
+  useEffect(() => {
+    const canvasNode = canvasRef.current;
+    if (!canvasNode) {
+      return;
+    }
+
+    const updateCanvasSize = () => {
+      const nextSize = {
+        width: canvasNode.clientWidth,
+        height: canvasNode.clientHeight,
+      };
+
+      setCanvasSize(prev =>
+        prev.width === nextSize.width && prev.height === nextSize.height ? prev : nextSize
+      );
+      measureItemSizes();
+    };
+
+    updateCanvasSize();
+
+    const observer = new ResizeObserver(() => {
+      updateCanvasSize();
+    });
+
+    observer.observe(canvasNode);
+
+    return () => observer.disconnect();
+  }, [measureItemSizes]);
+
+  useEffect(() => {
+    window.localStorage.setItem(BOARD_THEME_STORAGE_KEY, backgroundTheme);
+  }, [backgroundTheme]);
+
+  useEffect(() => {
+    window.localStorage.setItem(BOARD_LAMP_STORAGE_KEY, String(isLampOn));
+  }, [isLampOn]);
 
   const removeDragListeners = useCallback(() => {
     const handlers = dragHandlersRef.current;
@@ -96,17 +345,113 @@ export default function App() {
     dragHandlersRef.current = null;
   }, []);
 
+  const removePanListeners = useCallback(() => {
+    const handlers = panHandlersRef.current;
+    if (!handlers) return;
+
+    window.removeEventListener('pointermove', handlers.onMove);
+    window.removeEventListener('pointerup', handlers.onUp);
+    window.removeEventListener('pointercancel', handlers.onUp);
+    panHandlersRef.current = null;
+  }, []);
+
+  const getItemSize = useCallback((item: EvidenceItem): ItemSize => {
+    return itemSizes[item.id] ?? ITEM_FALLBACK_SIZES[item.type];
+  }, [itemSizes]);
+
+  const boardBounds = useMemo(() => getBoardBounds(items, itemSizes), [items, itemSizes]);
+  const viewportRect = useMemo(() => getViewportRect(camera, canvasSize), [camera, canvasSize]);
+
+  const getItemGeometry = useCallback((id: string): ItemGeometry | null => {
+    const item = items.find(entry => entry.id === id);
+    if (!item) {
+      return null;
+    }
+
+    const size = getItemSize(item);
+    const halfWidth = size.width / 2;
+    const halfHeight = size.height / 2;
+    const rotationRad = (item.rotation * Math.PI) / 180;
+
+    return {
+      center: {
+        x: item.position.x + halfWidth,
+        y: item.position.y + halfHeight,
+      },
+      halfWidth,
+      halfHeight,
+      rotationRad,
+    };
+  }, [getItemSize, items]);
+
+  const getConnectionLine = useCallback((connection: Connection) => {
+    const fromGeometry = getItemGeometry(connection.fromId);
+    const toGeometry = getItemGeometry(connection.toId);
+
+    if (!fromGeometry || !toGeometry) {
+      return null;
+    }
+
+    const from = getConnectionEndpoint(fromGeometry, toGeometry.center);
+    const to = getConnectionEndpoint(toGeometry, fromGeometry.center);
+
+    return {
+      from,
+      to,
+      midpoint: {
+        x: (from.x + to.x) / 2,
+        y: (from.y + to.y) / 2,
+      },
+    };
+  }, [getItemGeometry]);
+
+  const clampItemPosition = useCallback((item: EvidenceItem, nextPosition: Position) => {
+    const currentCamera = cameraRef.current;
+    const currentCanvasSize = canvasSizeRef.current.width > 0 && canvasSizeRef.current.height > 0
+      ? canvasSizeRef.current
+      : DEFAULT_BOARD_SIZE;
+    const viewport = getViewportRect(currentCamera, currentCanvasSize);
+    const size = getItemSize(item);
+    const halfWidth = size.width / 2;
+    const halfHeight = size.height / 2;
+    const rotationRad = (item.rotation * Math.PI) / 180;
+    const rotatedExtents = getRotatedExtents(size.width, size.height, rotationRad);
+    const safeInset = SAFE_AREA_INSET / currentCamera.zoom;
+    const nextCenterX = nextPosition.x + halfWidth;
+    const nextCenterY = nextPosition.y + halfHeight;
+    const clampedCenterX = clamp(
+      nextCenterX,
+      viewport.x + safeInset + rotatedExtents.x,
+      viewport.x + viewport.width - safeInset - rotatedExtents.x
+    );
+    const clampedCenterY = clamp(
+      nextCenterY,
+      viewport.y + safeInset + rotatedExtents.y,
+      viewport.y + viewport.height - safeInset - rotatedExtents.y
+    );
+
+    return {
+      position: {
+        x: clampedCenterX - halfWidth,
+        y: clampedCenterY - halfHeight,
+      },
+      hitBoundary: Math.abs(clampedCenterX - nextCenterX) > 0.01 || Math.abs(clampedCenterY - nextCenterY) > 0.01,
+    };
+  }, [getItemSize]);
+
   useEffect(() => {
     return () => {
       activeDragRef.current = null;
+      activePanRef.current = null;
       removeDragListeners();
+      removePanListeners();
       itemsRef.current.forEach(item => {
         if (item.imageSource === 'upload' && item.imageUrl) {
           URL.revokeObjectURL(item.imageUrl);
         }
       });
     };
-  }, [removeDragListeners]);
+  }, [removeDragListeners, removePanListeners]);
 
   const cancelLinkMode = useCallback(() => {
     setIsLinkMode(false);
@@ -200,6 +545,9 @@ export default function App() {
 
     event.preventDefault();
     setSelectedConnectionId(null);
+    setActiveDragId(id);
+    setIsDragAtBoundary(false);
+    measureItemSizes();
 
     activeDragRef.current = {
       id,
@@ -207,17 +555,25 @@ export default function App() {
       itemStart: { ...item.position },
     };
 
+    activePanRef.current = null;
+    setIsPanning(false);
+    removePanListeners();
     removeDragListeners();
 
     const onMove = (moveEvent: PointerEvent) => {
       const activeDrag = activeDragRef.current;
       if (!activeDrag) return;
+      const draggedItem = itemsRef.current.find(prevItem => prevItem.id === activeDrag.id);
+      if (!draggedItem) return;
 
-      const zoomScale = zoomRef.current || 1;
-      const nextPosition = {
+      const zoomScale = cameraRef.current.zoom || 1;
+      const unclampedPosition = {
         x: activeDrag.itemStart.x + (moveEvent.clientX - activeDrag.pointerStart.x) / zoomScale,
         y: activeDrag.itemStart.y + (moveEvent.clientY - activeDrag.pointerStart.y) / zoomScale,
       };
+      const { position: nextPosition, hitBoundary } = clampItemPosition(draggedItem, unclampedPosition);
+
+      setIsDragAtBoundary(hitBoundary);
 
       setItems(prev =>
         prev.map(prevItem =>
@@ -230,6 +586,8 @@ export default function App() {
 
     const onUp = () => {
       activeDragRef.current = null;
+      setActiveDragId(null);
+      setIsDragAtBoundary(false);
       removeDragListeners();
     };
 
@@ -241,7 +599,12 @@ export default function App() {
 
   const handleLinkModeToggle = () => {
     activeDragRef.current = null;
+    activePanRef.current = null;
+    setActiveDragId(null);
+    setIsDragAtBoundary(false);
+    setIsPanning(false);
     removeDragListeners();
+    removePanListeners();
     setSelectedConnectionId(null);
 
     if (isLinkMode) {
@@ -269,6 +632,40 @@ export default function App() {
     }
 
     setSelectedConnectionId(null);
+    activeDragRef.current = null;
+    setActiveDragId(null);
+    setIsDragAtBoundary(false);
+    removeDragListeners();
+    removePanListeners();
+    setIsPanning(true);
+
+    activePanRef.current = {
+      pointerStart: { x: event.clientX, y: event.clientY },
+      panStart: { ...cameraRef.current.pan },
+    };
+
+    const onMove = (moveEvent: PointerEvent) => {
+      const activePan = activePanRef.current;
+      if (!activePan) return;
+
+      const unclampedPan = {
+        x: activePan.panStart.x + (moveEvent.clientX - activePan.pointerStart.x),
+        y: activePan.panStart.y + (moveEvent.clientY - activePan.pointerStart.y),
+      };
+
+      setCamera(prev => (arePositionsEqual(prev.pan, unclampedPan) ? prev : { ...prev, pan: unclampedPan }));
+    };
+
+    const onUp = () => {
+      activePanRef.current = null;
+      setIsPanning(false);
+      removePanListeners();
+    };
+
+    panHandlersRef.current = { onMove, onUp };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   };
 
   const handleConnectionPointerDown = (id: string, event: React.PointerEvent<SVGLineElement>) => {
@@ -279,42 +676,46 @@ export default function App() {
     setSelectedConnectionId(id);
   };
 
-  const getObjectCenter = (id: string) => {
-    const item = items.find(i => i.id === id);
-    if (!item) return { x: 0, y: 0 };
-
-    const node = evidenceRefs.current[id];
-    if (node) {
-      return {
-        x: item.position.x + node.offsetWidth / 2,
-        y: item.position.y,
-      };
-    }
-
-    // Fallback for first paint before refs exist.
-    let width = 256;
-    if (item.type === 'note') {
-      width = 192;
-    }
-    if (item.type === 'report') {
-      width = 320;
-    }
+  const getDefaultPosition = (): Position => {
+    const jitter = 80;
+    const currentViewport = getViewportRect(
+      cameraRef.current,
+      canvasSizeRef.current.width > 0 && canvasSizeRef.current.height > 0
+        ? canvasSizeRef.current
+        : DEFAULT_BOARD_SIZE
+    );
 
     return {
-      x: item.position.x + width / 2,
-      y: item.position.y,
+      x: currentViewport.x + currentViewport.width / 2 - 140 + (Math.random() * jitter - jitter / 2),
+      y: currentViewport.y + currentViewport.height / 2 - 120 + (Math.random() * jitter - jitter / 2),
     };
   };
 
-  const getDefaultPosition = (): Position => {
-    const canvasWidth = canvasRef.current?.clientWidth ?? 1000;
-    const canvasHeight = canvasRef.current?.clientHeight ?? 700;
-    const jitter = 80;
+  const setZoomLevel = (nextZoom: number) => {
+    setCamera(prev => {
+      const zoom = clamp(nextZoom, MIN_ZOOM, MAX_ZOOM);
+      if (Math.abs(prev.zoom - zoom) < 0.001) {
+        return prev;
+      }
 
-    return {
-      x: Math.max(24, canvasWidth / (2 * zoom) - 140 + (Math.random() * jitter - jitter / 2)),
-      y: Math.max(40, canvasHeight / (2 * zoom) - 120 + (Math.random() * jitter - jitter / 2)),
-    };
+      const currentCanvasSize = canvasSizeRef.current.width > 0 && canvasSizeRef.current.height > 0
+        ? canvasSizeRef.current
+        : DEFAULT_BOARD_SIZE;
+      const currentViewport = getViewportRect(prev, currentCanvasSize);
+      const centerX = currentViewport.x + currentViewport.width / 2;
+      const centerY = currentViewport.y + currentViewport.height / 2;
+      const nextViewportWidth = currentCanvasSize.width / zoom;
+      const nextViewportHeight = currentCanvasSize.height / zoom;
+      const nextPan = {
+        x: -(centerX - nextViewportWidth / 2) * zoom,
+        y: -(centerY - nextViewportHeight / 2) * zoom,
+      };
+
+      return {
+        zoom,
+        pan: nextPan,
+      };
+    });
   };
 
   const getRotation = () => Number(((Math.random() - 0.5) * 6).toFixed(2));
@@ -440,6 +841,13 @@ export default function App() {
 
     delete evidenceRefs.current[id];
     setItems(prev => prev.filter(item => item.id !== id));
+    setItemSizes(prev => {
+      if (!prev[id]) return prev;
+
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
     setConnections(prev => prev.filter(conn => conn.fromId !== id && conn.toId !== id));
     setSelectedConnectionId(prev => {
       if (!prev) return prev;
@@ -450,22 +858,64 @@ export default function App() {
       return selectedConnection.fromId === id || selectedConnection.toId === id ? null : prev;
     });
     setLinkSourceId(prev => prev === id ? null : prev);
+    setActiveDragId(prev => prev === id ? null : prev);
+    setIsDragAtBoundary(false);
   };
 
   const selectedConnection = selectedConnectionId
     ? connections.find(connection => connection.id === selectedConnectionId) ?? null
     : null;
-  const selectedConnectionMidpoint = selectedConnection
-    ? (() => {
-        const from = getObjectCenter(selectedConnection.fromId);
-        const to = getObjectCenter(selectedConnection.toId);
+  const selectedConnectionLine = selectedConnection ? getConnectionLine(selectedConnection) : null;
+  const selectedConnectionMidpoint = selectedConnectionLine?.midpoint ?? null;
+  const boardOrigin = useMemo(
+    () => ({ x: boardBounds.minX, y: boardBounds.minY }),
+    [boardBounds.minX, boardBounds.minY]
+  );
+  const zoom = camera.zoom;
+  const minimapItems = useMemo(() => {
+    return items.map(item => {
+      const size = getItemSize(item);
+      const rotationRad = (item.rotation * Math.PI) / 180;
+      const rotatedExtents = getRotatedExtents(size.width, size.height, rotationRad);
+      const centerX = item.position.x + size.width / 2;
+      const centerY = item.position.y + size.height / 2;
+      const left = ((centerX - rotatedExtents.x - boardBounds.minX) / boardBounds.width) * 100;
+      const top = ((centerY - rotatedExtents.y - boardBounds.minY) / boardBounds.height) * 100;
+      const width = ((rotatedExtents.x * 2) / boardBounds.width) * 100;
+      const height = ((rotatedExtents.y * 2) / boardBounds.height) * 100;
 
-        return {
-          x: (from.x + to.x) / 2,
-          y: (from.y + to.y) / 2,
-        };
-      })()
-    : null;
+      return {
+        id: item.id,
+        left: `${clamp(left, 0, 100)}%`,
+        top: `${clamp(top, 0, 100)}%`,
+        width: `${clamp(width, 1.2, 100)}%`,
+        height: `${clamp(height, 1.2, 100)}%`,
+        className:
+          item.type === 'note'
+            ? 'border-yellow-100/30 bg-yellow-100/12'
+            : item.type === 'report'
+              ? 'border-slate-100/25 bg-slate-100/12'
+              : 'border-white/25 bg-white/12',
+      };
+    });
+  }, [boardBounds, getItemSize, items]);
+  const minimapViewportStyle = useMemo(() => {
+    const visibleMinX = Math.max(viewportRect.x, boardBounds.minX);
+    const visibleMinY = Math.max(viewportRect.y, boardBounds.minY);
+    const visibleMaxX = Math.min(viewportRect.x + viewportRect.width, boardBounds.maxX);
+    const visibleMaxY = Math.min(viewportRect.y + viewportRect.height, boardBounds.maxY);
+    const left = ((visibleMinX - boardBounds.minX) / boardBounds.width) * 100;
+    const top = ((visibleMinY - boardBounds.minY) / boardBounds.height) * 100;
+    const width = ((Math.max(visibleMaxX - visibleMinX, 0)) / boardBounds.width) * 100;
+    const height = ((Math.max(visibleMaxY - visibleMinY, 0)) / boardBounds.height) * 100;
+
+    return {
+      left: `${clamp(left, 0, 100)}%`,
+      top: `${clamp(top, 0, 100)}%`,
+      width: `${clamp(width, 0, 100)}%`,
+      height: `${clamp(height, 0, 100)}%`,
+    };
+  }, [boardBounds, viewportRect]);
 
   return (
     <div className="relative flex h-screen w-full flex-col overflow-hidden bg-background-dark font-sans text-slate-100">
@@ -552,6 +1002,61 @@ export default function App() {
               </button>
             </div>
           </div>
+
+          <div>
+            <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4 px-3">Background</h3>
+            <div className="grid grid-cols-3 gap-2">
+              {BACKGROUND_THEMES.map(theme => {
+                const isActive = theme.id === backgroundTheme;
+
+                return (
+                  <button
+                    key={theme.id}
+                    type="button"
+                    onClick={() => setBackgroundTheme(theme.id)}
+                    className={`rounded-xl border px-2 py-3 text-left transition-all ${
+                      isActive
+                        ? 'border-evidence-red/50 bg-white/10 shadow-[0_0_20px_rgba(255,46,46,0.14)]'
+                        : 'border-white/8 bg-white/4 hover:border-white/15 hover:bg-white/8'
+                    }`}
+                  >
+                    <span className={`mb-2 block h-8 rounded-lg border border-black/5 ${theme.accent}`}></span>
+                    <span className="block text-xs font-semibold text-white">{theme.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          <div>
+            <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4 px-3">Lighting</h3>
+            <button
+              type="button"
+              aria-pressed={isLampOn}
+              onClick={() => setIsLampOn(prev => !prev)}
+              className={`flex w-full items-center gap-3 rounded-xl border px-3 py-3 text-left transition-all duration-300 ${
+                isLampOn
+                  ? 'border-amber-300/35 bg-amber-200/10 text-white shadow-[0_0_28px_rgba(251,191,36,0.16)]'
+                  : 'border-white/8 bg-white/4 text-slate-300 hover:border-white/15 hover:bg-white/8'
+              }`}
+            >
+              <span
+                className={`flex h-10 w-10 items-center justify-center rounded-full border transition-all duration-300 ${
+                  isLampOn
+                    ? 'border-amber-200/40 bg-amber-100/12 text-amber-200 shadow-[0_0_18px_rgba(251,191,36,0.3)]'
+                    : 'border-white/10 bg-black/20 text-slate-500'
+                }`}
+              >
+                <Lightbulb className={`h-5 w-5 transition-all duration-300 ${isLampOn ? 'fill-current' : ''}`} />
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block text-sm font-semibold">{isLampOn ? 'Investigation Lamp On' : 'Investigation Lamp Off'}</span>
+                <span className="mt-1 block text-xs text-slate-400">
+                  {isLampOn ? 'Warm spotlight with dark vignette.' : 'Board lighting returned to neutral.'}
+                </span>
+              </span>
+            </button>
+          </div>
           
           <div className="mt-auto">
             <div className="p-4 rounded-xl bg-black/20 border border-white/5">
@@ -566,68 +1071,139 @@ export default function App() {
 
         {/* Main Canvas Area */}
         <main 
-          className="flex-1 relative wood-texture canvas-grain overflow-hidden cursor-grab active:cursor-grabbing"
+          className={`board-lamp-scene flex-1 relative canvas-grain board-theme-${backgroundTheme} overflow-hidden ${
+            isLampOn ? 'board-lamp-scene-on' : ''
+          } ${
+            isLinkMode ? 'cursor-default' : isPanning ? 'cursor-grabbing' : 'cursor-grab'
+          }`}
           ref={canvasRef}
         >
+          <div
+            aria-hidden="true"
+            className={`board-lamp-layer board-lamp-glow ${isLampOn ? 'board-lamp-layer-on' : ''}`}
+          />
+          <div
+            aria-hidden="true"
+            className={`board-lamp-layer board-lamp-vignette ${isLampOn ? 'board-lamp-layer-on' : ''}`}
+          />
+
+          {activeDragId && (
+            <div
+              aria-hidden="true"
+              className={`board-safe-area pointer-events-none absolute z-[15] rounded-[32px] ${
+                isDragAtBoundary ? 'board-safe-area-locked' : ''
+              }`}
+              style={{
+                top: SAFE_AREA_INSET,
+                right: SAFE_AREA_INSET,
+                bottom: SAFE_AREA_INSET,
+                left: SAFE_AREA_INSET,
+              }}
+            />
+          )}
+
           <motion.div 
-            className="absolute inset-0 w-full h-full"
-            style={{ scale: zoom, originX: 0.5, originY: 0.5 }}
+            className="absolute inset-0 z-10 w-full h-full"
+            style={{
+              transform: `translate(${camera.pan.x}px, ${camera.pan.y}px) scale(${zoom})`,
+              transformOrigin: '0 0',
+              touchAction: 'none',
+            }}
             onPointerDown={handleCanvasPointerDown}
           >
             {/* Yarn Connections */}
-            <svg className="absolute inset-0 z-10 h-full w-full">
-              {connections.map(conn => {
-                const from = getObjectCenter(conn.fromId);
-                const to = getObjectCenter(conn.toId);
-                const isSelected = conn.id === selectedConnectionId;
-
-                return (
-                  <g key={conn.id}>
-                    <line
-                      stroke="transparent"
-                      strokeLinecap="round"
-                      strokeWidth="18"
-                      x1={from.x}
-                      y1={from.y}
-                      x2={to.x}
-                      y2={to.y}
-                      style={{ pointerEvents: isLinkMode ? 'none' : 'stroke' }}
-                      onPointerDown={(event) => handleConnectionPointerDown(conn.id, event)}
-                    />
-                    <line
-                      className="yarn-line pointer-events-none"
-                      stroke={isSelected ? '#ffd1d1' : '#ff2e2e'}
-                      strokeLinecap="round"
-                      strokeWidth={isSelected ? '4.5' : '3'}
-                      x1={from.x}
-                      y1={from.y}
-                      x2={to.x}
-                      y2={to.y}
-                      opacity={isSelected ? 1 : 0.92}
-                    />
-                  </g>
-                );
-              })}
-            </svg>
-
-            {selectedConnectionMidpoint && !isLinkMode && (
-              <button
-                type="button"
-                aria-label="Delete selected link"
-                onPointerDown={(event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                }}
-                onClick={() => removeConnection(selectedConnectionId!)}
-                className="absolute z-40 flex h-9 w-9 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-white/20 bg-black/80 text-white shadow-[0_10px_30px_rgba(0,0,0,0.35)] transition-all hover:scale-105 hover:bg-red-600"
-                style={{
-                  left: selectedConnectionMidpoint.x,
-                  top: selectedConnectionMidpoint.y,
-                }}
+            <div
+              className="pointer-events-none absolute z-10"
+              style={{
+                left: boardOrigin.x,
+                top: boardOrigin.y,
+                width: boardBounds.width,
+                height: boardBounds.height,
+              }}
+            >
+              <svg
+                className="pointer-events-auto absolute inset-0 overflow-visible"
+                viewBox={`0 0 ${boardBounds.width} ${boardBounds.height}`}
               >
-                <Trash2 className="h-4 w-4" />
-              </button>
-            )}
+                {connections.map(conn => {
+                  const line = getConnectionLine(conn);
+                  const isSelected = conn.id === selectedConnectionId;
+
+                  if (!line) {
+                    return null;
+                  }
+
+                  const fromX = line.from.x - boardOrigin.x;
+                  const fromY = line.from.y - boardOrigin.y;
+                  const toX = line.to.x - boardOrigin.x;
+                  const toY = line.to.y - boardOrigin.y;
+
+                  return (
+                    <g key={conn.id}>
+                      <line
+                        stroke="transparent"
+                        strokeLinecap="round"
+                        strokeWidth="18"
+                        x1={fromX}
+                        y1={fromY}
+                        x2={toX}
+                        y2={toY}
+                        style={{ pointerEvents: isLinkMode ? 'none' : 'stroke' }}
+                        onPointerDown={(event) => handleConnectionPointerDown(conn.id, event)}
+                      />
+                      <line
+                        className="yarn-line pointer-events-none"
+                        stroke={isSelected ? '#ffd1d1' : '#ff2e2e'}
+                        strokeLinecap="round"
+                        strokeWidth={isSelected ? '4.5' : '3'}
+                        x1={fromX}
+                        y1={fromY}
+                        x2={toX}
+                        y2={toY}
+                        opacity={isSelected ? 1 : 0.92}
+                      />
+                      <circle
+                        className="yarn-endpoint pointer-events-none"
+                        cx={fromX}
+                        cy={fromY}
+                        r={isSelected ? '5.5' : '4.5'}
+                        fill={isSelected ? '#fff1f2' : '#ffd4d4'}
+                        stroke={isSelected ? '#ffe4e6' : '#ff7a7a'}
+                        strokeWidth="1.4"
+                      />
+                      <circle
+                        className="yarn-endpoint pointer-events-none"
+                        cx={toX}
+                        cy={toY}
+                        r={isSelected ? '5.5' : '4.5'}
+                        fill={isSelected ? '#fff1f2' : '#ffd4d4'}
+                        stroke={isSelected ? '#ffe4e6' : '#ff7a7a'}
+                        strokeWidth="1.4"
+                      />
+                    </g>
+                  );
+                })}
+              </svg>
+
+              {selectedConnectionMidpoint && !isLinkMode && (
+                <button
+                  type="button"
+                  aria-label="Delete selected link"
+                  onPointerDown={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                  }}
+                  onClick={() => removeConnection(selectedConnectionId!)}
+                  className="pointer-events-auto absolute z-40 flex h-9 w-9 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-white/20 bg-black/80 text-white shadow-[0_10px_30px_rgba(0,0,0,0.35)] transition-all hover:scale-105 hover:bg-red-600"
+                  style={{
+                    left: selectedConnectionMidpoint.x - boardOrigin.x,
+                    top: selectedConnectionMidpoint.y - boardOrigin.y,
+                  }}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              )}
+            </div>
 
             {/* Evidence Items */}
             {items.map(item => {
@@ -643,11 +1219,9 @@ export default function App() {
                   onPointerDown={(event) => handleItemPointerDown(item.id, event)}
                   style={{ 
                     position: 'absolute',
-                    top: 0,
-                    left: 0,
+                    top: item.position.y,
+                    left: item.position.x,
                     zIndex: isSelectedSource ? 30 : 20,
-                    x: item.position.x,
-                    y: item.position.y,
                     rotate: item.rotation,
                     touchAction: 'none',
                   }}
@@ -763,13 +1337,13 @@ export default function App() {
           <div className="absolute bottom-8 right-8 flex flex-col gap-4 z-50">
             <div className="flex flex-col bg-black/40 backdrop-blur-xl border border-white/10 rounded-xl overflow-hidden shadow-2xl">
               <button 
-                onClick={() => setZoom(prev => Math.min(prev + 0.1, 2))}
+                onClick={() => setZoomLevel(zoom + 0.1)}
                 className="p-3 hover:bg-white/10 text-white/70 transition-colors border-b border-white/5"
               >
                 <Plus className="w-5 h-5" />
               </button>
               <button 
-                onClick={() => setZoom(prev => Math.max(prev - 0.1, 0.2))}
+                onClick={() => setZoomLevel(zoom - 0.1)}
                 className="p-3 hover:bg-white/10 text-white/70 transition-colors"
               >
                 <Minus className="w-5 h-5" />
@@ -785,13 +1359,23 @@ export default function App() {
 
           {/* MiniMap */}
           <div className="absolute bottom-8 left-8 w-44 h-28 bg-black/30 backdrop-blur-xl border border-white/10 rounded-xl overflow-hidden shadow-2xl z-50 p-1.5 pointer-events-none">
-            <div className="w-full h-full bg-black/40 relative rounded-lg border border-white/5">
-              {/* Simplified representations of items */}
-              <div className="absolute top-4 left-4 w-5 h-5 border border-white/20 bg-white/5"></div>
-              <div className="absolute top-12 left-20 w-3 h-3 border border-white/20 bg-white/5"></div>
-              <div className="absolute top-16 left-10 w-8 h-4 border border-white/20 bg-white/5"></div>
-              {/* Viewport indicator */}
-              <div className="absolute top-3 left-3 w-28 h-20 border-2 border-evidence-red/40 bg-white/5"></div>
+            <div className={`w-full h-full relative rounded-lg border border-white/5 board-theme-${backgroundTheme}`}>
+              {minimapItems.map(item => (
+                <div
+                  key={item.id}
+                  className={`absolute rounded-[2px] border ${item.className}`}
+                  style={{
+                    left: item.left,
+                    top: item.top,
+                    width: item.width,
+                    height: item.height,
+                  }}
+                />
+              ))}
+              <div
+                className="absolute border-2 border-evidence-red/50 bg-white/5 shadow-[0_0_12px_rgba(255,46,46,0.2)]"
+                style={minimapViewportStyle}
+              />
             </div>
           </div>
         </main>
