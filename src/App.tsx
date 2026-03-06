@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { 
   FolderHeart, 
   Search, 
@@ -10,10 +10,11 @@ import {
   Plus, 
   Minus, 
   Maximize,
-  Pin
+  Pin,
+  Trash2
 } from 'lucide-react';
-import { motion, useMotionValue, useTransform } from 'motion/react';
-import { EvidenceItem, Connection, Position } from './types';
+import { motion } from 'motion/react';
+import { Connection, EvidenceItem, EvidenceType, Position } from './types';
 
 const INITIAL_ITEMS: EvidenceItem[] = [
   {
@@ -53,33 +54,187 @@ const INITIAL_CONNECTIONS: Connection[] = [
   { id: 'c3', fromId: '1', toId: '3' }
 ];
 
+const SAMPLE_PHOTOS = [
+  'https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?q=80&w=1000&auto=format&fit=crop',
+  'https://images.unsplash.com/photo-1520637836862-4d197d17c35a?q=80&w=1000&auto=format&fit=crop',
+  'https://images.unsplash.com/photo-1518391846015-55a9cc003b25?q=80&w=1000&auto=format&fit=crop'
+];
+
 export default function App() {
   const [items, setItems] = useState<EvidenceItem[]>(INITIAL_ITEMS);
   const [connections, setConnections] = useState<Connection[]>(INITIAL_CONNECTIONS);
   const [zoom, setZoom] = useState(0.625);
   const canvasRef = useRef<HTMLDivElement>(null);
+  const evidenceRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const idCounterRef = useRef(INITIAL_ITEMS.length + 1);
+  const activeDragRef = useRef<{ id: string; pointerStart: Position; itemStart: Position } | null>(null);
+  const zoomRef = useRef(zoom);
+  const dragHandlersRef = useRef<{ onMove: (event: PointerEvent) => void; onUp: () => void } | null>(null);
 
-  const handleDrag = (id: string, info: any) => {
-    setItems(prev => prev.map(item => 
-      item.id === id 
-        ? { ...item, position: { x: item.position.x + info.delta.x / zoom, y: item.position.y + info.delta.y / zoom } }
-        : item
-    ));
+  useEffect(() => {
+    zoomRef.current = zoom;
+  }, [zoom]);
+
+  const removeDragListeners = useCallback(() => {
+    const handlers = dragHandlersRef.current;
+    if (!handlers) return;
+
+    window.removeEventListener('pointermove', handlers.onMove);
+    window.removeEventListener('pointerup', handlers.onUp);
+    window.removeEventListener('pointercancel', handlers.onUp);
+    dragHandlersRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      activeDragRef.current = null;
+      removeDragListeners();
+    };
+  }, [removeDragListeners]);
+
+  const handleItemPointerDown = (id: string, event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+
+    const item = items.find(i => i.id === id);
+    if (!item) return;
+
+    event.preventDefault();
+
+    activeDragRef.current = {
+      id,
+      pointerStart: { x: event.clientX, y: event.clientY },
+      itemStart: { ...item.position },
+    };
+
+    removeDragListeners();
+
+    const onMove = (moveEvent: PointerEvent) => {
+      const activeDrag = activeDragRef.current;
+      if (!activeDrag) return;
+
+      const zoomScale = zoomRef.current || 1;
+      const nextPosition = {
+        x: activeDrag.itemStart.x + (moveEvent.clientX - activeDrag.pointerStart.x) / zoomScale,
+        y: activeDrag.itemStart.y + (moveEvent.clientY - activeDrag.pointerStart.y) / zoomScale,
+      };
+
+      setItems(prev =>
+        prev.map(prevItem =>
+          prevItem.id === activeDrag.id
+            ? { ...prevItem, position: nextPosition }
+            : prevItem
+        )
+      );
+    };
+
+    const onUp = () => {
+      activeDragRef.current = null;
+      removeDragListeners();
+    };
+
+    dragHandlersRef.current = { onMove, onUp };
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onUp);
   };
 
-  const getPinPosition = (id: string) => {
+  const getObjectCenter = (id: string) => {
     const item = items.find(i => i.id === id);
     if (!item) return { x: 0, y: 0 };
-    
-    let width = 256; // w-64
-    if (item.type === 'note') width = 192; // w-48
-    if (item.type === 'report') width = 320; // w-80
-    
-    // Pin is at top center
+
+    const node = evidenceRefs.current[id];
+    if (node) {
+      return {
+        x: item.position.x + node.offsetWidth / 2,
+        y: item.position.y,
+      };
+    }
+
+    // Fallback for first paint before refs exist.
+    let width = 256;
+    if (item.type === 'note') {
+      width = 192;
+    }
+    if (item.type === 'report') {
+      width = 320;
+    }
+
     return {
       x: item.position.x + width / 2,
-      y: item.position.y
+      y: item.position.y,
     };
+  };
+
+  const getDefaultPosition = (): Position => {
+    const canvasWidth = canvasRef.current?.clientWidth ?? 1000;
+    const canvasHeight = canvasRef.current?.clientHeight ?? 700;
+    const jitter = 80;
+
+    return {
+      x: Math.max(24, canvasWidth / (2 * zoom) - 140 + (Math.random() * jitter - jitter / 2)),
+      y: Math.max(40, canvasHeight / (2 * zoom) - 120 + (Math.random() * jitter - jitter / 2)),
+    };
+  };
+
+  const addEvidence = (type: EvidenceType) => {
+    const id = String(idCounterRef.current++);
+    const position = getDefaultPosition();
+    const rotation = Number(((Math.random() - 0.5) * 6).toFixed(2));
+
+    setItems(prev => {
+      const sequence = prev.filter(item => item.type === type).length + 1;
+
+      if (type === 'note') {
+        return [
+          ...prev,
+          {
+            id,
+            type: 'note',
+            title: `Witness Note ${sequence}`,
+            content: 'Cross-check alibi timeline with downtown CCTV archives.',
+            rotation,
+            position,
+            pinColor: '#2563eb',
+          },
+        ];
+      }
+
+      if (type === 'report') {
+        return [
+          ...prev,
+          {
+            id,
+            type: 'report',
+            title: `Lab Report ${sequence}`,
+            fileNumber: `CASE ID: NIGHTSHADE-${100 + sequence}`,
+            content: 'Supplemental lab pass indicates trace fibers consistent with vehicle trunk lining.',
+            rotation,
+            position,
+            pinColor: '#1e293b',
+          },
+        ];
+      }
+
+      return [
+        ...prev,
+        {
+          id,
+          type: 'photo',
+          title: `Scene Photo ${sequence}`,
+          fileNumber: `File #${80 + sequence}-Echo`,
+          imageUrl: SAMPLE_PHOTOS[(sequence - 1) % SAMPLE_PHOTOS.length],
+          rotation,
+          position,
+          pinColor: '#ef4444',
+        },
+      ];
+    });
+  };
+
+  const removeEvidence = (id: string) => {
+    delete evidenceRefs.current[id];
+    setItems(prev => prev.filter(item => item.id !== id));
+    setConnections(prev => prev.filter(conn => conn.fromId !== id && conn.toId !== id));
   };
 
   return (
@@ -129,11 +284,17 @@ export default function App() {
           <div>
             <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-widest mb-4 px-3">Case Tools</h3>
             <div className="flex flex-col gap-1">
-              <button className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-white/10 text-white font-medium transition-all group border border-white/5">
+              <button
+                onClick={() => addEvidence('note')}
+                className="flex items-center gap-3 px-3 py-2.5 rounded-lg bg-white/10 text-white font-medium transition-all group border border-white/5"
+              >
                 <FileText className="w-5 h-5 group-hover:scale-110 transition-transform" />
                 <span className="text-sm">New Note</span>
               </button>
-              <button className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:bg-white/5 hover:text-white transition-all group">
+              <button
+                onClick={() => addEvidence('photo')}
+                className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-slate-400 hover:bg-white/5 hover:text-white transition-all group"
+              >
                 <Camera className="w-5 h-5 group-hover:scale-110 transition-transform" />
                 <span className="text-sm">Add Evidence</span>
               </button>
@@ -171,8 +332,8 @@ export default function App() {
             {/* Yarn Connections */}
             <svg className="absolute inset-0 w-full h-full pointer-events-none z-10">
               {connections.map(conn => {
-                const from = getPinPosition(conn.fromId);
-                const to = getPinPosition(conn.toId);
+                const from = getObjectCenter(conn.fromId);
+                const to = getObjectCenter(conn.toId);
                 return (
                   <line 
                     key={conn.id}
@@ -193,16 +354,32 @@ export default function App() {
             {items.map(item => (
               <motion.div
                 key={item.id}
-                drag
-                dragMomentum={false}
-                onDrag={(e, info) => handleDrag(item.id, info)}
-                initial={{ x: item.position.x, y: item.position.y, rotate: item.rotation }}
+                ref={(node) => {
+                  evidenceRefs.current[item.id] = node;
+                }}
+                onPointerDown={(event) => handleItemPointerDown(item.id, event)}
                 style={{ 
                   position: 'absolute',
+                  top: 0,
+                  left: 0,
                   zIndex: 20,
+                  x: item.position.x,
+                  y: item.position.y,
+                  rotate: item.rotation,
+                  touchAction: 'none',
                 }}
-                className="group"
+                className="group relative cursor-grab active:cursor-grabbing"
               >
+                <button
+                  type="button"
+                  aria-label={`Remove ${item.title}`}
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={() => removeEvidence(item.id)}
+                  className="absolute -top-3 -right-3 z-40 flex h-7 w-7 items-center justify-center rounded-full border border-white/20 bg-black/70 text-white/80 opacity-90 shadow-lg transition-all hover:scale-105 hover:bg-red-600 hover:text-white sm:opacity-0 sm:group-hover:opacity-100"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+
                 {/* Push Pin */}
                 <div 
                   className="absolute -top-4 left-1/2 -translate-x-1/2 z-30 pushpin-shadow pointer-events-none"
