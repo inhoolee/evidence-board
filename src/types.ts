@@ -11,6 +11,7 @@ export interface EvidenceItem {
   title: string;
   content?: string;
   imageUrl?: string;
+  imageSource?: 'remote' | 'upload';
   fileNumber?: string;
   rotation: number;
   position: Position;
